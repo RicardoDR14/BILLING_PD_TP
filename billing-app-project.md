@@ -707,6 +707,22 @@ JWT_EXPIRES_IN=24h
 VITE_API_URL=/api
 ```
 
+### Como gerar o JWT_SECRET para desenvolvimento local
+
+O `JWT_SECRET` pode ser qualquer string longa e aleatória. Para gerar um valor seguro sem instalar nada extra:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Copia o output (ex: `a3f8c2d1e9b4f7a2...`) e mete-o no `backend/.env`:
+
+```bash
+JWT_SECRET=a3f8c2d1e9b4f7a2c5d8e1f4b7a2c5d8e1f4b7a2c5d8e1f4b7a2c5d8e1f4b7a2
+```
+
+> Em produção, o valor é gerido pelo Jenkins Credentials Store (`jwt-secret`) — nunca commitado nem escrito à mão.
+
 ### Onde criar cada secret
 
 ```
