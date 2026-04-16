@@ -981,6 +981,33 @@ Objetivo: interface React funcional a comunicar com o backend local.
 - [ ] Criar `frontend/.env` local e `frontend/.env.example`
 - [ ] Testar app no browser com backend a correr localmente (`node src/index.js`)
 
+**Comandos para testar o frontend localmente (facultativo — apenas para desenvolvimento)**
+
+> Estes comandos servem apenas para testar o frontend antes da containerização. Não são necessários em produção.
+
+```bash
+# 1. Base de dados
+docker run -d --name billing-db \
+  -e POSTGRES_DB=billing_db \
+  -e POSTGRES_USER=billing_user \
+  -e POSTGRES_PASSWORD=change_me \
+  -p 5432:5432 \
+  postgres:16-alpine
+
+# 2. Inicializar o schema (aguardar 4 segundos)
+sleep 4 && docker exec -i billing-db psql -U billing_user -d billing_db \
+  < backend/src/db/init.sql
+
+# 3. Backend (terminal 1)
+cd backend && node src/index.js
+
+# 4. Frontend (terminal 2)
+cd frontend && npm install && npm run dev
+```
+
+> Se o container `billing-db` já existir de sessão anterior: `docker start billing-db` (schema já está inicializado).
+> Frontend disponível em `http://localhost:5173`
+
 **Jenkins — nenhuma alteração nesta fase**
 
 **Estado da pipeline no fim desta fase:**
