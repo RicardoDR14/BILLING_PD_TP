@@ -1,0 +1,14 @@
+# secrets — NUNCA commitar
+.env
+backend/.env
+frontend/.env
+ansible/group_vars/vault.yml
+
+# dependências e builds
+node_modules/
+dist/
+build/
+
+# sistema
+.DS_Store
+*.log
