@@ -126,13 +126,19 @@ Developer git push
   │ 5. Email   │──► notificação success/failure
   └────────────┘
                          │ ansible-playbook
-                         ▼ SSH
-                  ┌─────────────┐
-                  │ Target Host │
-                  │             │
-                  │ docker-compose pull
-                  │ docker-compose up -d
-                  └─────────────┘
+                         ▼ SSH (por grupo do inventário)
+              ┌──────────────────────────────┐
+              │  [db_servers]                │
+              │  docker_container: postgres  │
+              ├──────────────────────────────┤
+              │  [backend_servers]           │
+              │  docker_container: backend   │
+              ├──────────────────────────────┤
+              │  [frontend_servers]          │
+              │  render nginx.conf.j2        │
+              │  docker_container: frontend  │
+              └──────────────────────────────┘
+              (pode ser 1 VM ou 3 VMs distintas)
 ```
 
 ---
@@ -267,18 +273,18 @@ billing-app/                          ← raiz do repositório GitHub
 │           └── init.sql              ← schema completo (CREATE TABLE users, expenses)
 │
 ├── ansible/
-│   ├── inventory.ini                 ← [billing_servers] com IP do host
-│   ├── playbook.yml                  ← tasks de install + upgrade
+│   ├── inventory.ini                 ← grupos: [db_servers] [backend_servers] [frontend_servers]
+│   ├── playbook.yml                  ← 3 plays, community.docker.docker_container (sem compose)
 │   ├── templates/
-│   │   └── docker-compose.yml.j2    ← template Jinja2 com {{ vars }}
+│   │   └── nginx.conf.j2            ← nginx com proxy_pass http://{{ backend_host }}:{{ backend_port }}/
 │   └── group_vars/
-│       ├── all.yml                   ← COMMITAR: vars não-sensíveis
+│       ├── all.yml                   ← COMMITAR: vars não-sensíveis (inclui db_host, backend_host)
 │       └── vault.yml                 ← NÃO COMMITAR em plain text; encriptar com ansible-vault
 │
 ├── jenkins/
 │   └── Jenkinsfile                   ← pipeline declarativo completo
 │
-├── docker-compose.yml                ← para desenvolvimento local
+├── docker-compose.yml                ← APENAS desenvolvimento local (nunca vai para produção)
 ├── .gitignore
 └── README.md
 ```
@@ -409,17 +415,7 @@ networks:
 
 > **Ponto crítico:** em desenvolvimento local, cria um ficheiro `.env` na raiz com as vars `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `JWT_SECRET`. Este ficheiro está no `.gitignore` e nunca é commitado.
 
-### `ansible/templates/docker-compose.yml.j2` (produção)
-
-Igual ao `docker-compose.yml` local, mas com variáveis Jinja2 em vez de `${...}`:
-
-```yaml
-# Substituições Jinja2 feitas pelo Ansible em runtime:
-# ${DB_NAME}      → {{ db_name }}
-# ${DB_PASSWORD}  → {{ db_password }}
-# ${JWT_SECRET}   → {{ jwt_secret }}
-# build: ./...    → image: {{ dockerhub_user }}/billing-backend:{{ image_tag }}
-```
+> **Nota arquitectural:** o `docker-compose.yml` é exclusivo do ambiente local. Em produção, o Ansible gere cada container directamente com `community.docker.docker_container` — sem `docker-compose` no servidor de destino. Isto permite deployar DB, backend e frontend em máquinas distintas.
 
 ---
 
@@ -584,12 +580,27 @@ Caminho: **Manage Jenkins → Credentials → System → Global credentials → 
 
 ## 8. Deploy com Ansible
 
+### Princípio arquitectural
+
+O Ansible **não usa `docker-compose` em produção**. Gere cada container directamente com `community.docker.docker_container`, via SSH, em cada host do inventário. Isto permite:
+- DB, backend e frontend em máquinas distintas
+- Sem dependência de `docker-compose-plugin` nos servidores de destino
+- Playbook com 3 plays independentes, cada um a targetar um grupo
+
 ### `ansible/inventory.ini`
 
 ```ini
-[billing_servers]
-production ansible_host=<IP_DO_SERVIDOR> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+[db_servers]
+db-host ansible_host=<IP_DB> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+[backend_servers]
+backend-host ansible_host=<IP_BACKEND> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+[frontend_servers]
+frontend-host ansible_host=<IP_FRONTEND> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
 ```
+
+> Para uma única VM (desenvolvimento/demo): os 3 grupos podem apontar para o mesmo IP.
 
 ### `ansible/group_vars/all.yml` (commitado no repo)
 
@@ -598,9 +609,12 @@ production ansible_host=<IP_DO_SERVIDOR> ansible_user=ubuntu ansible_ssh_private
 db_name:        billing_db
 db_user:        billing_user
 db_port:        5432
-app_port:       80
 backend_port:   3000
+app_port:       80
 app_dir:        /opt/billing
+# IPs/hostnames dos servidores — preencher com valores reais
+db_host:        <IP_DO_DB_SERVER>
+backend_host:   <IP_DO_BACKEND_SERVER>
 ```
 
 ### `ansible/group_vars/vault.yml` (encriptado com ansible-vault)
@@ -613,58 +627,144 @@ vault_db_password: "password_producao_segura"
 vault_jwt_secret:  "string_muito_longa_e_aleatoria_para_jwt_producao"
 ```
 
-> Quando se usa vault, as vars `db_password` e `jwt_secret` no playbook ficam como `"{{ vault_db_password }}"`. No Jenkins, em vez de `--extra-vars`, passa-se `--vault-password-file` com o ficheiro de Secret File. Para simplicidade no contexto deste trabalho, é aceitável usar apenas `--extra-vars` sem vault.
+> Para simplicidade no contexto deste trabalho, é aceitável usar apenas `--extra-vars` no Jenkins em vez de vault.
+
+### `ansible/templates/nginx.conf.j2`
+
+```nginx
+server {
+    listen 80;
+
+    location / {
+        root   /usr/share/nginx/html;
+        index  index.html;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        proxy_pass         http://{{ backend_host }}:{{ backend_port }}/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+    }
+}
+```
+
+> Este template é renderizado pelo Ansible e montado no container frontend como volume, substituindo o `nginx.conf` que está baked-in na imagem (que serve apenas para o `docker-compose` local).
 
 ### `ansible/playbook.yml`
 
 ```yaml
 ---
-- name: Deploy billing-app
-  hosts: billing_servers
+# Play 1 — Base de dados
+- name: Deploy DB
+  hosts: db_servers
   become: true
-
   tasks:
-    - name: Instalar dependências do sistema
+    - name: Instalar Docker
       apt:
-        name:
-          - docker.io
-          - docker-compose-plugin
-          - python3-pip
+        name: [docker.io]
         state: present
         update_cache: yes
 
-    - name: Adicionar utilizador ao grupo docker
-      user:
-        name: "{{ ansible_user }}"
-        groups: docker
-        append: yes
-
-    - name: Criar directório da aplicação
+    - name: Criar directório da app
       file:
         path: "{{ app_dir }}"
         state: directory
-        owner: "{{ ansible_user }}"
         mode: "0755"
 
-    - name: Copiar docker-compose para o servidor (via template)
-      template:
-        src: templates/docker-compose.yml.j2
-        dest: "{{ app_dir }}/docker-compose.yml"
-        owner: "{{ ansible_user }}"
-        mode: "0644"
+    - name: Copiar init.sql para o servidor
+      copy:
+        src: ../backend/src/db/init.sql
+        dest: "{{ app_dir }}/init.sql"
 
-    - name: Pull das imagens mais recentes
-      community.docker.docker_compose_v2:
-        project_src: "{{ app_dir }}"
-        pull: always
-      become_user: "{{ ansible_user }}"
+    - name: Container DB
+      community.docker.docker_container:
+        name: billing-db
+        image: postgres:16-alpine
+        state: started
+        restart_policy: unless-stopped
+        env:
+          POSTGRES_DB:       "{{ db_name }}"
+          POSTGRES_USER:     "{{ db_user }}"
+          POSTGRES_PASSWORD: "{{ db_password }}"
+        volumes:
+          - "billing_pgdata:/var/lib/postgresql/data"
+          - "{{ app_dir }}/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"
+        ports:
+          - "5432:5432"
 
-    - name: Iniciar / actualizar containers
-      community.docker.docker_compose_v2:
-        project_src: "{{ app_dir }}"
+# Play 2 — Backend
+- name: Deploy Backend
+  hosts: backend_servers
+  become: true
+  tasks:
+    - name: Instalar Docker
+      apt:
+        name: [docker.io]
         state: present
-        recreate: always
-      become_user: "{{ ansible_user }}"
+        update_cache: yes
+
+    - name: Pull imagem backend
+      community.docker.docker_image:
+        name: "{{ dockerhub_user }}/billing-backend:{{ image_tag }}"
+        source: pull
+
+    - name: Container Backend
+      community.docker.docker_container:
+        name: billing-backend
+        image: "{{ dockerhub_user }}/billing-backend:{{ image_tag }}"
+        state: started
+        restart_policy: unless-stopped
+        env:
+          PORT:           "3000"
+          DB_HOST:        "{{ db_host }}"
+          DB_PORT:        "{{ db_port }}"
+          DB_NAME:        "{{ db_name }}"
+          DB_USER:        "{{ db_user }}"
+          DB_PASSWORD:    "{{ db_password }}"
+          JWT_SECRET:     "{{ jwt_secret }}"
+          JWT_EXPIRES_IN: "24h"
+        ports:
+          - "3000:3000"
+
+# Play 3 — Frontend
+- name: Deploy Frontend
+  hosts: frontend_servers
+  become: true
+  tasks:
+    - name: Instalar Docker
+      apt:
+        name: [docker.io]
+        state: present
+        update_cache: yes
+
+    - name: Criar directório da app
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Renderizar nginx.conf com backend_host correcto
+      template:
+        src: templates/nginx.conf.j2
+        dest: "{{ app_dir }}/nginx.conf"
+
+    - name: Pull imagem frontend
+      community.docker.docker_image:
+        name: "{{ dockerhub_user }}/billing-frontend:{{ image_tag }}"
+        source: pull
+
+    - name: Container Frontend
+      community.docker.docker_container:
+        name: billing-frontend
+        image: "{{ dockerhub_user }}/billing-frontend:{{ image_tag }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ app_dir }}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+        ports:
+          - "80:80"
 ```
 
 ---
@@ -960,6 +1060,23 @@ Objetivo: API REST funcional testável com Postman, sem Docker ainda.
 
 **Jenkins — nenhuma alteração nesta fase**
 
+```bash
+# 1. Base de dados
+docker run -d --name billing-db \
+  -e POSTGRES_DB=billing_db \
+  -e POSTGRES_USER=billing_user \
+  -e POSTGRES_PASSWORD=change_me \
+  -p 5432:5432 \
+  postgres:16-alpine
+
+# 2. Inicializar o schema (aguardar 4 segundos)
+sleep 4 && docker exec -i billing-db psql -U billing_user -d billing_db \
+  < backend/src/db/init.sql
+
+# 3. Backend (terminal 1)
+cd backend && node src/index.js
+```
+
 A pipeline continua com apenas o stage Checkout. O objetivo desta fase é ter código funcional antes de o containerizar.
 
 **Estado da pipeline no fim desta fase:**
@@ -1103,16 +1220,16 @@ Checkout ✓ → Build images ✓ → Push to Docker Hub ✓
 
 ### Fase 5 — Ansible deploy (dias 6–8)
 
-Objetivo: Ansible a fazer deploy automático no servidor após cada push.
+Objetivo: Ansible a fazer deploy automático em cada servidor após cada push. **Sem docker-compose no servidor** — Ansible usa `community.docker.docker_container` directamente.
 
 **Ansible — estrutura**
-- [ ] Criar `ansible/inventory.ini` com host alvo (pode ser `localhost` para testar primeiro)
-- [ ] Criar `ansible/group_vars/all.yml` com variáveis não-sensíveis
-- [ ] Criar `ansible/templates/docker-compose.yml.j2` com variáveis Jinja2
-- [ ] Criar `ansible/playbook.yml` completo
+- [ ] Criar `ansible/inventory.ini` com grupos `[db_servers]`, `[backend_servers]`, `[frontend_servers]` (pode apontar todos para o mesmo IP numa única VM)
+- [ ] Criar `ansible/group_vars/all.yml` com variáveis não-sensíveis (incluindo `db_host` e `backend_host`)
+- [ ] Criar `ansible/templates/nginx.conf.j2` com `proxy_pass http://{{ backend_host }}:{{ backend_port }}/`
+- [ ] Criar `ansible/playbook.yml` com 3 plays (`Deploy DB`, `Deploy Backend`, `Deploy Frontend`)
 - [ ] Testar localmente: `ansible-playbook -i ansible/inventory.ini ansible/playbook.yml --check`
 - [ ] Testar deploy real: `ansible-playbook -i ansible/inventory.ini ansible/playbook.yml`
-- [ ] Verificar que `install` e `upgrade` são ambos idempotentes (correr 2x sem erros)
+- [ ] Verificar idempotência: correr o playbook 2x sem erros nem efeitos secundários
 
 **Jenkins — adicionar stage Deploy**
 - [ ] Atualizar `jenkins/Jenkinsfile` com o stage Deploy após o Push:
@@ -1191,7 +1308,7 @@ O bloco `withCredentials` mascara os valores nos logs (`****`). No entanto, evit
 
 ### Idempotência do Ansible
 
-O playbook deve poder correr múltiplas vezes sem erros. Os módulos `apt`, `file`, `template`, `docker_compose_v2` são todos idempotentes por natureza. Evitar usar o módulo `shell` ou `command` com operações não-idempotentes.
+O playbook deve poder correr múltiplas vezes sem erros. Os módulos `apt`, `file`, `template`, `docker_image`, `docker_container` são todos idempotentes por natureza. Evitar usar o módulo `shell` ou `command` com operações não-idempotentes.
 
 ### Tagging de imagens Docker
 

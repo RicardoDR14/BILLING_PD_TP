@@ -1,11 +1,23 @@
 pipeline {
     agent any
 
+    environment {
+        IMAGE_BACKEND  = "billing-backend"
+        IMAGE_FRONTEND = "billing-frontend"
+    }
+
     stages {
 
         stage('Checkout') {
             steps {
                 checkout scm
+            }
+        }
+
+        stage('Build images') {
+            steps {
+                sh "docker build -t ${IMAGE_BACKEND}:${BUILD_NUMBER} ./backend"
+                sh "docker build -t ${IMAGE_FRONTEND}:${BUILD_NUMBER} ./frontend"
             }
         }
 
