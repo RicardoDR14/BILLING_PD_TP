@@ -526,16 +526,33 @@ pipeline {
 
 O Jenkins corre como um container Docker **separado da aplicação** — não faz parte do `docker-compose.yml` da app. É infraestrutura de CI/CD que vive na máquina do developer ou num servidor dedicado.
 
-> **Importante:** o Docker socket tem de ser montado para que o Jenkins consiga correr `docker build` e `docker push` dentro da pipeline.
+A imagem base `jenkins/jenkins:lts` não inclui o Docker CLI. É necessário construir uma imagem customizada com Docker instalado e montar o socket do host para que a pipeline consiga correr `docker build` e `docker push`.
+
+**Passo 1 — construir a imagem Jenkins com Docker CLI:**
+
+```bash
+docker build -t jenkins-with-docker - <<'EOF'
+FROM jenkins/jenkins:lts
+USER root
+RUN apt-get update && apt-get install -y docker.io
+RUN usermod -aG docker jenkins
+USER jenkins
+EOF
+```
+
+**Passo 2 — arrancar o container:**
 
 ```bash
 docker run -d -p 8080:8080 -p 50000:50000 \
   -v jenkins_home:/var/jenkins_home \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  --group-add $(stat -c '%g' /var/run/docker.sock) \
   --name jenkins \
-  jenkins/jenkins:lts
+  jenkins-with-docker
 ```
 
+- `--group-add $(stat -c '%g' /var/run/docker.sock)` — adiciona o GID do socket do host como grupo suplementar do utilizador `jenkins`, resolvendo o erro `permission denied` ao aceder ao socket
+- `-v /var/run/docker.sock:/var/run/docker.sock` — monta o socket para que o Jenkins use o Docker do host
 - O volume `jenkins_home` é um **named volume** — persiste mesmo que o container seja removido
 - Para parar: `docker stop jenkins`
 - Para voltar a correr: `docker start jenkins` (dados intactos)
