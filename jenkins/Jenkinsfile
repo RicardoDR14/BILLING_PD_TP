@@ -2,8 +2,9 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_BACKEND  = "billing-backend"
-        IMAGE_FRONTEND = "billing-frontend"
+        IMAGE_BACKEND   = "billing-backend"
+        IMAGE_FRONTEND  = "billing-frontend"
+        // Imagens publicadas em: ricardodrisec/billing-backend e ricardodrisec/billing-frontend
     }
 
     stages {
