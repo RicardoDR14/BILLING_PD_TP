@@ -21,5 +21,48 @@ pipeline {
             }
         }
 
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKERHUB_USER',
+                    passwordVariable: 'DOCKERHUB_PASS'
+                )]) {
+                    sh "docker login -u ${DOCKERHUB_USER} -p ${DOCKERHUB_PASS}"
+
+                    sh "docker tag ${IMAGE_BACKEND}:${BUILD_NUMBER} ${DOCKERHUB_USER}/${IMAGE_BACKEND}:${BUILD_NUMBER}"
+                    sh "docker push ${DOCKERHUB_USER}/${IMAGE_BACKEND}:${BUILD_NUMBER}"
+                    sh "docker tag ${IMAGE_BACKEND}:${BUILD_NUMBER} ${DOCKERHUB_USER}/${IMAGE_BACKEND}:latest"
+                    sh "docker push ${DOCKERHUB_USER}/${IMAGE_BACKEND}:latest"
+
+                    sh "docker tag ${IMAGE_FRONTEND}:${BUILD_NUMBER} ${DOCKERHUB_USER}/${IMAGE_FRONTEND}:${BUILD_NUMBER}"
+                    sh "docker push ${DOCKERHUB_USER}/${IMAGE_FRONTEND}:${BUILD_NUMBER}"
+                    sh "docker tag ${IMAGE_FRONTEND}:${BUILD_NUMBER} ${DOCKERHUB_USER}/${IMAGE_FRONTEND}:latest"
+                    sh "docker push ${DOCKERHUB_USER}/${IMAGE_FRONTEND}:latest"
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            mail(
+                to: 'rrodrigues@brndts.com',
+                subject: "[billing-app] Build #${BUILD_NUMBER} — SUCESSO",
+                body: "Pipeline concluída com sucesso.\nBuild: ${BUILD_URL}"
+            )
+        }
+        failure {
+            mail(
+                to: 'rrodrigues@brndts.com',
+                subject: "[billing-app] Build #${BUILD_NUMBER} — FALHOU",
+                body: "A pipeline falhou. Verifica os logs em:\n${BUILD_URL}console"
+            )
+        }
+        always {
+            sh "docker rmi ${IMAGE_BACKEND}:${BUILD_NUMBER} || true"
+            sh "docker rmi ${IMAGE_FRONTEND}:${BUILD_NUMBER} || true"
+        }
     }
 }
