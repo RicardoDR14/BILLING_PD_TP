@@ -46,20 +46,25 @@ pipeline {
     }
 
     post {
-        success {
-            mail(
-                to: 'rrodrigues@brndts.com',
-                subject: "[billing-app] Build #${BUILD_NUMBER} — SUCESSO",
-                body: "Pipeline concluída com sucesso.\nBuild: ${BUILD_URL}"
-            )
-        }
-        failure {
-            mail(
-                to: 'rrodrigues@brndts.com',
-                subject: "[billing-app] Build #${BUILD_NUMBER} — FALHOU",
-                body: "A pipeline falhou. Verifica os logs em:\n${BUILD_URL}console"
-            )
-        }
+        // TODO: configurar SMTP antes de activar emails
+        // success {
+        //     script {
+        //         try {
+        //             mail(to: 'a2022147797@isec.pt',
+        //                 subject: "[billing-app] Build #${BUILD_NUMBER} — SUCESSO",
+        //                 body: "Pipeline concluída com sucesso.\nBuild: ${BUILD_URL}")
+        //         } catch(e) { echo "Email skipped: ${e.message}" }
+        //     }
+        // }
+        // failure {
+        //     script {
+        //         try {
+        //             mail(to: 'a2022147797@isec.pt',
+        //                 subject: "[billing-app] Build #${BUILD_NUMBER} — FALHOU",
+        //                 body: "A pipeline falhou. Verifica os logs em:\n${BUILD_URL}console")
+        //         } catch(e) { echo "Email skipped: ${e.message}" }
+        //     }
+        // }
         always {
             sh "docker rmi ${IMAGE_BACKEND}:${BUILD_NUMBER} || true"
             sh "docker rmi ${IMAGE_FRONTEND}:${BUILD_NUMBER} || true"
