@@ -21,12 +21,14 @@
       pip:
         name: docker
         state: present
+        extra_args: --break-system-packages
 
     - name: Garantir que o serviço Docker está activo
       service:
         name: docker
         state: started
         enabled: yes
+      ignore_errors: yes
 
     - name: Criar directório da app
       file:
@@ -79,12 +81,14 @@
       pip:
         name: docker
         state: present
+        extra_args: --break-system-packages
 
     - name: Garantir que o serviço Docker está activo
       service:
         name: docker
         state: started
         enabled: yes
+      ignore_errors: yes
 
     - name: Pull imagem backend do Docker Hub
       community.docker.docker_image:
@@ -133,12 +137,14 @@
       pip:
         name: docker
         state: present
+        extra_args: --break-system-packages
 
     - name: Garantir que o serviço Docker está activo
       service:
         name: docker
         state: started
         enabled: yes
+      ignore_errors: yes
 
     - name: Criar directório da app
       file:
