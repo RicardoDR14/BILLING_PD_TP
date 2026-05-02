@@ -59,6 +59,16 @@
         ports:
           - "{{ db_port }}:5432"
 
+    - name: Aguardar DB ficar pronto
+      command: docker exec billing-db pg_isready -U {{ db_user }} -d {{ db_name }}
+      register: pg_ready
+      until: pg_ready.rc == 0
+      retries: 10
+      delay: 3
+
+    - name: Garantir que o schema existe
+      command: docker exec billing-db psql -U {{ db_user }} -d {{ db_name }} -f /docker-entrypoint-initdb.d/init.sql
+
 
 # =============================================================================
 # Play 2 — Backend (Node.js/Express)
