@@ -148,7 +148,7 @@ Developer git push
 ### Tabela `users`
 
 ```sql
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id            SERIAL PRIMARY KEY,
   name          VARCHAR(100) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
@@ -159,7 +159,7 @@ CREATE TABLE users (
 ### Tabela `expenses`
 
 ```sql
-CREATE TABLE expenses (
+CREATE TABLE IF NOT EXISTS expenses (
   id          SERIAL PRIMARY KEY,
   user_id     INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   title       VARCHAR(200) NOT NULL,
@@ -173,11 +173,11 @@ CREATE TABLE expenses (
   updated_at  TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX idx_expenses_user_id ON expenses(user_id);
-CREATE INDEX idx_expenses_status  ON expenses(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_expenses_user_id ON expenses(user_id);
+CREATE INDEX IF NOT EXISTS idx_expenses_status  ON expenses(user_id, status);
 ```
 
-> **Nota:** O ficheiro `backend/src/db/init.sql` contém este schema completo e é montado automaticamente no container PostgreSQL em `/docker-entrypoint-initdb.d/init.sql` — executa apenas na primeira inicialização (quando o volume está vazio).
+> **Nota:** O ficheiro `backend/src/db/init.sql` usa `IF NOT EXISTS` em todas as instruções, tornando-o idempotente. Em deploy com Ansible, o playbook aguarda o PostgreSQL ficar pronto e corre sempre o `init.sql` via `docker exec` — garantindo que o schema existe mesmo em volumes pré-existentes.
 
 ---
 
@@ -282,7 +282,8 @@ billing-app/                          ← raiz do repositório GitHub
 │       └── vault.yml                 ← NÃO COMMITAR em plain text; encriptar com ansible-vault
 │
 ├── jenkins/
-│   └── Jenkinsfile                   ← pipeline declarativo completo
+│   ├── Dockerfile                    ← imagem Jenkins customizada com Docker CLI + Ansible
+│   └── Jenkinsfile                   ← pipeline declarativo completo (4 stages + email)
 │
 ├── docker-compose.yml                ← APENAS desenvolvimento local (nunca vai para produção)
 ├── .gitignore
@@ -326,9 +327,11 @@ RUN npm run build
 # Stage 2 — serve com nginx
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 EXPOSE 80
 ```
+
+> **Nota:** O ficheiro é copiado para `/etc/nginx/templates/` (não para `/etc/nginx/conf.d/`). O nginx:alpine processa automaticamente todos os ficheiros `*.template` nessa pasta com `envsubst` ao arrancar — substituindo `${BACKEND_HOST}` e `${BACKEND_PORT}` pelos valores das variáveis de ambiente passadas ao container. Isto elimina a necessidade de montar volumes do host.
 
 ### `frontend/nginx.conf`
 
@@ -336,22 +339,22 @@ EXPOSE 80
 server {
     listen 80;
 
-    # serve os ficheiros estáticos do React
     location / {
         root   /usr/share/nginx/html;
         index  index.html;
-        try_files $uri $uri/ /index.html;   # necessário para React Router
+        try_files $uri $uri/ /index.html;
     }
 
-    # proxy reverso: /api/* → backend container
     location /api/ {
-        proxy_pass         http://backend:3000/;
+        proxy_pass         http://${BACKEND_HOST}:${BACKEND_PORT}/;
         proxy_http_version 1.1;
         proxy_set_header   Host $host;
         proxy_set_header   X-Real-IP $remote_addr;
     }
 }
 ```
+
+> **Nota:** `${BACKEND_HOST}` e `${BACKEND_PORT}` são placeholders substituídos pelo `envsubst` do nginx ao arrancar. Em desenvolvimento local (docker-compose), passam `backend` e `3000`. Em produção (Ansible), passam `host.docker.internal` e `3000`.
 
 ### `backend/Dockerfile`
 
@@ -403,6 +406,9 @@ services:
   frontend:
     build: ./frontend
     ports: ["80:80"]
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: 3000
     depends_on: [backend]
     networks: [billing_net]
 
@@ -428,17 +434,14 @@ pipeline {
     agent any
 
     environment {
-        // Estas variáveis usam as credenciais configuradas no Jenkins
-        // DOCKERHUB_USER e DOCKERHUB_PASS vêm do bloco withCredentials abaixo
-        IMAGE_BACKEND  = "billing-backend"
-        IMAGE_FRONTEND = "billing-frontend"
+        IMAGE_BACKEND   = "billing-backend"
+        IMAGE_FRONTEND  = "billing-frontend"
     }
 
     stages {
 
         stage('Checkout') {
             steps {
-                // Jenkins faz checkout automático do repo configurado no job
                 checkout scm
             }
         }
@@ -453,17 +456,14 @@ pipeline {
         stage('Push to Docker Hub') {
             steps {
                 withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-creds',     // ← criada no Jenkins
+                    credentialsId: 'dockerhub-creds',
                     usernameVariable: 'DOCKERHUB_USER',
                     passwordVariable: 'DOCKERHUB_PASS'
                 )]) {
-                    sh "docker login -u ${DOCKERHUB_USER} -p ${DOCKERHUB_PASS}"
+                    sh 'docker login -u $DOCKERHUB_USER -p $DOCKERHUB_PASS'
 
-                    // tag BUILD_NUMBER para rastreabilidade
                     sh "docker tag ${IMAGE_BACKEND}:${BUILD_NUMBER} ${DOCKERHUB_USER}/${IMAGE_BACKEND}:${BUILD_NUMBER}"
                     sh "docker push ${DOCKERHUB_USER}/${IMAGE_BACKEND}:${BUILD_NUMBER}"
-
-                    // tag latest para que Ansible puxe sempre a versão mais recente
                     sh "docker tag ${IMAGE_BACKEND}:${BUILD_NUMBER} ${DOCKERHUB_USER}/${IMAGE_BACKEND}:latest"
                     sh "docker push ${DOCKERHUB_USER}/${IMAGE_BACKEND}:latest"
 
@@ -486,35 +486,43 @@ pipeline {
                     string(credentialsId: 'db-password', variable: 'DB_PASS'),
                     string(credentialsId: 'jwt-secret',  variable: 'JWT_SEC')
                 ]) {
-                    sh """
+                    sh '''
                         ansible-playbook -i ansible/inventory.ini ansible/playbook.yml \
-                            --extra-vars "image_tag=${BUILD_NUMBER} \
-                                          dockerhub_user=${DOCKERHUB_USER} \
-                                          db_password=${DB_PASS} \
-                                          jwt_secret=${JWT_SEC}"
-                    """
+                            --extra-vars "image_tag=$BUILD_NUMBER" \
+                            --extra-vars "dockerhub_user=$DOCKERHUB_USER" \
+                            --extra-vars "db_password=$DB_PASS" \
+                            --extra-vars "jwt_secret=$JWT_SEC"
+                    '''
                 }
             }
         }
+
     }
 
     post {
         success {
-            mail(
-                to: 'equipa@email.com',
-                subject: "[billing-app] Build #${BUILD_NUMBER} — SUCESSO",
-                body: "Pipeline concluída com sucesso.\nDeploy efectuado para o servidor.\nBuild: ${BUILD_URL}"
-            )
+            script {
+                try {
+                    mail(
+                        to: 'a2022147797@isec.pt',
+                        subject: "[billing-app] Build #${BUILD_NUMBER} — SUCESSO",
+                        body: "Pipeline concluída com sucesso.\nDeploy efectuado.\nBuild: ${BUILD_URL}"
+                    )
+                } catch(e) { echo "Email skipped: ${e.message}" }
+            }
         }
         failure {
-            mail(
-                to: 'equipa@email.com',
-                subject: "[billing-app] Build #${BUILD_NUMBER} — FALHOU",
-                body: "A pipeline falhou. Verifica os logs em:\n${BUILD_URL}console"
-            )
+            script {
+                try {
+                    mail(
+                        to: 'a2022147797@isec.pt',
+                        subject: "[billing-app] Build #${BUILD_NUMBER} — FALHOU",
+                        body: "A pipeline falhou. Verifica os logs em:\n${BUILD_URL}console"
+                    )
+                } catch(e) { echo "Email skipped: ${e.message}" }
+            }
         }
         always {
-            // limpa imagens locais para não acumular espaço no agente Jenkins
             sh "docker rmi ${IMAGE_BACKEND}:${BUILD_NUMBER} || true"
             sh "docker rmi ${IMAGE_FRONTEND}:${BUILD_NUMBER} || true"
         }
@@ -522,41 +530,75 @@ pipeline {
 }
 ```
 
+> **Notas de segurança do Jenkinsfile:**
+> - O `docker login` usa aspas simples (`sh 'docker login -u $DOCKERHUB_USER ...'`) — o shell expande `$DOCKERHUB_USER`, não o Groovy. Isto evita que o valor do secret apareça no script compilado.
+> - O bloco `ansible-playbook` usa `sh '''...'''` (aspas simples triplas) pela mesma razão — `$DB_PASS` e `$JWT_SEC` são expandidos pelo shell, nunca interpolados pelo Groovy.
+> - O bloco `mail()` está envolto em `try/catch` para que a pipeline não falhe se o SMTP não estiver configurado.
+
 ### Instalação do Jenkins (via Docker)
 
-O Jenkins corre como um container Docker **separado da aplicação** — não faz parte do `docker-compose.yml` da app. É infraestrutura de CI/CD que vive na máquina do developer ou num servidor dedicado.
+O Jenkins corre como um container Docker **separado da aplicação** — não faz parte do `docker-compose.yml` da app. É infraestrutura de CI/CD que vive na máquina do developer.
 
-A imagem base `jenkins/jenkins:lts` não inclui o Docker CLI. É necessário construir uma imagem customizada com Docker instalado e montar o socket do host para que a pipeline consiga correr `docker build` e `docker push`.
+A imagem base `jenkins/jenkins:lts` não inclui Docker CLI, Ansible, nem sudo. O ficheiro `jenkins/Dockerfile` constrói uma imagem customizada com tudo o necessário:
 
-**Passo 1 — construir a imagem Jenkins com Docker CLI:**
+### `jenkins/Dockerfile`
 
-```bash
-docker build -t jenkins-with-docker - <<'EOF'
+```dockerfile
 FROM jenkins/jenkins:lts
 USER root
-RUN apt-get update && apt-get install -y docker.io
+
+# Install Docker CLI, Ansible, pip and sudo
+RUN apt-get update && \
+    apt-get install -y docker.io ansible python3-pip sudo && \
+    rm -rf /var/lib/apt/lists/*
+
+# Allow jenkins to run sudo without a password (needed by ansible become: true)
+RUN echo "jenkins ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Pre-install the Docker Python SDK so Ansible community.docker modules work locally
+RUN pip3 install docker --break-system-packages
+
+# Add jenkins user to docker group so it can run docker commands
 RUN usermod -aG docker jenkins
+
 USER jenkins
-EOF
 ```
 
-**Passo 2 — arrancar o container:**
+**Passo 1 — construir a imagem:**
 
 ```bash
-docker run -d -p 8080:8080 -p 50000:50000 \
+cd jenkins
+docker build -t jenkins-with-docker .
+```
+
+**Passo 2 — arrancar o container (WSL2 + Docker Desktop):**
+
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -p 50000:50000 \
   -v jenkins_home:/var/jenkins_home \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  --group-add $(stat -c '%g' /var/run/docker.sock) \
+  -v /run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Debian/docker.sock:/var/run/docker.sock \
+  --group-add 1001 \
   --name jenkins \
   jenkins-with-docker
 ```
 
-- `--group-add $(stat -c '%g' /var/run/docker.sock)` — adiciona o GID do socket do host como grupo suplementar do utilizador `jenkins`, resolvendo o erro `permission denied` ao aceder ao socket
-- `-v /var/run/docker.sock:/var/run/docker.sock` — monta o socket para que o Jenkins use o Docker do host
-- O volume `jenkins_home` é um **named volume** — persiste mesmo que o container seja removido
+> O caminho do socket `/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Debian/docker.sock` e o grupo `1001` são específicos do Docker Desktop + WSL2. Se o Jenkins correr noutro ambiente (Linux nativo), usar `-v /var/run/docker.sock:/var/run/docker.sock` e `--group-add $(stat -c '%g' /var/run/docker.sock)`.
+
+- O volume `jenkins_home` é um **named volume** — todos os jobs, credenciais e histórico persistem mesmo que o container seja recriado
 - Para parar: `docker stop jenkins`
-- Para voltar a correr: `docker start jenkins` (dados intactos)
+- Para voltar a correr: `docker start jenkins`
 - Para destruir o volume (apaga tudo): `docker volume rm jenkins_home` — **não correr sem intenção**
+
+**Passo 3 — instalar a collection Ansible community.docker:**
+
+Esta collection fornece os módulos `docker_container` e `docker_image` usados pelo playbook. Instalar uma vez; fica guardada no volume `jenkins_home`.
+
+```bash
+docker exec -u jenkins jenkins \
+  ansible-galaxy collection install community.docker
+```
 
 **Plugins a instalar após o setup inicial** (Manage Jenkins → Plugins → Available):
 - Ansible
@@ -607,82 +649,91 @@ O Ansible **não usa `docker-compose` em produção**. Gere cada container direc
 ### `ansible/inventory.ini`
 
 ```ini
+# LOCALHOST (desenvolvimento local / WSL2)
+# ansible_connection=local ignora SSH e corre as tasks localmente via sudo.
 [db_servers]
-db-host ansible_host=<IP_DB> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+localhost ansible_connection=local
 
 [backend_servers]
-backend-host ansible_host=<IP_BACKEND> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+localhost ansible_connection=local
 
 [frontend_servers]
-frontend-host ansible_host=<IP_FRONTEND> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+localhost ansible_connection=local
+
+# REMOTE VMs (descomentar e substituir IPs para deploy em VMs separadas)
+# [db_servers]
+# db-vm ansible_host=<IP_DB> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+#
+# [backend_servers]
+# backend-vm ansible_host=<IP_BACKEND> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
+#
+# [frontend_servers]
+# frontend-vm ansible_host=<IP_FRONTEND> ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/id_rsa
 ```
 
-> Para uma única VM (desenvolvimento/demo): os 3 grupos podem apontar para o mesmo IP.
+> `ansible_connection=local` elimina a necessidade de SSH — o Ansible executa as tasks directamente no processo local via sudo. Para mudar para VMs remotas, basta comentar a secção `localhost` e descomentar a secção de VMs.
 
 ### `ansible/group_vars/all.yml` (commitado no repo)
 
 ```yaml
-# Variáveis não-sensíveis — podem estar no repositório
-db_name:        billing_db
-db_user:        billing_user
-db_port:        5432
-backend_port:   3000
-app_port:       80
-app_dir:        /opt/billing
-# IPs/hostnames dos servidores — preencher com valores reais
-db_host:        <IP_DO_DB_SERVER>
-backend_host:   <IP_DO_BACKEND_SERVER>
+# Variáveis não-sensíveis — commitadas no repositório.
+# Secrets (db_password, jwt_secret, dockerhub_user) passam via --extra-vars do Jenkins.
+
+db_name:      billing_db
+db_user:      billing_user
+db_port:      "5432"
+backend_port: "3000"
+app_port:     "80"
+app_dir:      /opt/billing
+
+# host.docker.internal resolve para o IP do host a partir de dentro de qualquer container
+# (Docker Desktop para Windows/Mac e WSL2). Em VMs remotas substituir pelo IP real.
+db_host:      "host.docker.internal"
+backend_host: "host.docker.internal"
 ```
 
-### `ansible/group_vars/vault.yml` (encriptado com ansible-vault)
-
-```yaml
-# Para criar: ansible-vault create ansible/group_vars/vault.yml
-# Para editar: ansible-vault edit ansible/group_vars/vault.yml
-# Para ver:    ansible-vault view ansible/group_vars/vault.yml
-vault_db_password: "password_producao_segura"
-vault_jwt_secret:  "string_muito_longa_e_aleatoria_para_jwt_producao"
-```
-
-> Para simplicidade no contexto deste trabalho, é aceitável usar apenas `--extra-vars` no Jenkins em vez de vault.
+> Os secrets (`db_password`, `jwt_secret`, `dockerhub_user`) **não estão neste ficheiro** — chegam ao Ansible via `--extra-vars` da Jenkins pipeline, lidos das Jenkins Credentials.
 
 ### `ansible/templates/nginx.conf.j2`
 
-```nginx
-server {
-    listen 80;
+Ficheiro presente no repositório mas **não usado activamente** na pipeline actual. A abordagem de volume mount que este template pressupõe não funciona em Docker Desktop + WSL2 (o Ansible escreve o ficheiro dentro do container Jenkins, e o Docker Desktop host daemon não consegue montá-lo nos containers da aplicação).
 
-    location / {
-        root   /usr/share/nginx/html;
-        index  index.html;
-        try_files $uri $uri/ /index.html;
-    }
-
-    location /api/ {
-        proxy_pass         http://{{ backend_host }}:{{ backend_port }}/;
-        proxy_http_version 1.1;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-    }
-}
-```
-
-> Este template é renderizado pelo Ansible e montado no container frontend como volume, substituindo o `nginx.conf` que está baked-in na imagem (que serve apenas para o `docker-compose` local).
+A solução em uso é a abordagem de env vars: o `nginx.conf` baked-in na imagem usa `${BACKEND_HOST}` e `${BACKEND_PORT}` como placeholders, e o nginx:alpine processa-os com `envsubst` ao arrancar a partir de variáveis de ambiente passadas directamente ao container.
 
 ### `ansible/playbook.yml`
 
 ```yaml
 ---
-# Play 1 — Base de dados
+
+# =============================================================================
+# Play 1 — Base de dados (PostgreSQL)
+# =============================================================================
 - name: Deploy DB
   hosts: db_servers
   become: true
+
   tasks:
-    - name: Instalar Docker
+
+    - name: Instalar Docker e Python pip
       apt:
-        name: [docker.io]
+        name:
+          - docker.io
+          - python3-pip
         state: present
         update_cache: yes
+
+    - name: Instalar SDK Python para Docker
+      pip:
+        name: docker
+        state: present
+        extra_args: --break-system-packages
+
+    - name: Garantir que o serviço Docker está activo
+      service:
+        name: docker
+        state: started
+        enabled: yes
+      ignore_errors: yes
 
     - name: Criar directório da app
       file:
@@ -694,12 +745,14 @@ server {
       copy:
         src: ../backend/src/db/init.sql
         dest: "{{ app_dir }}/init.sql"
+        mode: "0644"
 
     - name: Container DB
       community.docker.docker_container:
         name: billing-db
         image: postgres:16-alpine
         state: started
+        recreate: true
         restart_policy: unless-stopped
         env:
           POSTGRES_DB:       "{{ db_name }}"
@@ -709,32 +762,64 @@ server {
           - "billing_pgdata:/var/lib/postgresql/data"
           - "{{ app_dir }}/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"
         ports:
-          - "5432:5432"
+          - "{{ db_port }}:5432"
 
-# Play 2 — Backend
+    - name: Aguardar DB ficar pronto
+      command: docker exec billing-db pg_isready -U {{ db_user }} -d {{ db_name }}
+      register: pg_ready
+      until: pg_ready.rc == 0
+      retries: 10
+      delay: 3
+
+    - name: Garantir que o schema existe
+      command: docker exec billing-db psql -U {{ db_user }} -d {{ db_name }} -f /docker-entrypoint-initdb.d/init.sql
+
+
+# =============================================================================
+# Play 2 — Backend (Node.js/Express)
+# =============================================================================
 - name: Deploy Backend
   hosts: backend_servers
   become: true
+
   tasks:
-    - name: Instalar Docker
+
+    - name: Instalar Docker e Python pip
       apt:
-        name: [docker.io]
+        name:
+          - docker.io
+          - python3-pip
         state: present
         update_cache: yes
 
-    - name: Pull imagem backend
+    - name: Instalar SDK Python para Docker
+      pip:
+        name: docker
+        state: present
+        extra_args: --break-system-packages
+
+    - name: Garantir que o serviço Docker está activo
+      service:
+        name: docker
+        state: started
+        enabled: yes
+      ignore_errors: yes
+
+    - name: Pull imagem backend do Docker Hub
       community.docker.docker_image:
         name: "{{ dockerhub_user }}/billing-backend:{{ image_tag }}"
         source: pull
+        force_source: yes
 
     - name: Container Backend
       community.docker.docker_container:
         name: billing-backend
         image: "{{ dockerhub_user }}/billing-backend:{{ image_tag }}"
         state: started
+        recreate: true
         restart_policy: unless-stopped
         env:
-          PORT:           "3000"
+          PORT:           "{{ backend_port }}"
           DB_HOST:        "{{ db_host }}"
           DB_PORT:        "{{ db_port }}"
           DB_NAME:        "{{ db_name }}"
@@ -743,46 +828,66 @@ server {
           JWT_SECRET:     "{{ jwt_secret }}"
           JWT_EXPIRES_IN: "24h"
         ports:
-          - "3000:3000"
+          - "{{ backend_port }}:{{ backend_port }}"
 
-# Play 3 — Frontend
+
+# =============================================================================
+# Play 3 — Frontend (React + nginx)
+# =============================================================================
 - name: Deploy Frontend
   hosts: frontend_servers
   become: true
+
   tasks:
-    - name: Instalar Docker
+
+    - name: Instalar Docker e Python pip
       apt:
-        name: [docker.io]
+        name:
+          - docker.io
+          - python3-pip
         state: present
         update_cache: yes
 
-    - name: Criar directório da app
-      file:
-        path: "{{ app_dir }}"
-        state: directory
-        mode: "0755"
+    - name: Instalar SDK Python para Docker
+      pip:
+        name: docker
+        state: present
+        extra_args: --break-system-packages
 
-    - name: Renderizar nginx.conf com backend_host correcto
-      template:
-        src: templates/nginx.conf.j2
-        dest: "{{ app_dir }}/nginx.conf"
+    - name: Garantir que o serviço Docker está activo
+      service:
+        name: docker
+        state: started
+        enabled: yes
+      ignore_errors: yes
 
-    - name: Pull imagem frontend
+    - name: Pull imagem frontend do Docker Hub
       community.docker.docker_image:
         name: "{{ dockerhub_user }}/billing-frontend:{{ image_tag }}"
         source: pull
+        force_source: yes
 
     - name: Container Frontend
       community.docker.docker_container:
         name: billing-frontend
         image: "{{ dockerhub_user }}/billing-frontend:{{ image_tag }}"
         state: started
+        recreate: true
         restart_policy: unless-stopped
-        volumes:
-          - "{{ app_dir }}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+        env:
+          BACKEND_HOST: "{{ backend_host }}"
+          BACKEND_PORT: "{{ backend_port }}"
         ports:
-          - "80:80"
+          - "{{ app_port }}:80"
 ```
+
+> **Notas sobre o playbook:**
+> - `recreate: true` — recria sempre o container para garantir que a nova imagem está em execução
+> - `force_source: yes` — força re-pull mesmo que a tag já exista localmente
+> - `ignore_errors: yes` na task de serviço Docker — necessário porque dentro de um container Jenkins não existe systemd; o Docker já corre via socket do host
+> - `extra_args: --break-system-packages` no pip — necessário em Python 3.13+ que bloqueia instalações system-wide
+> - A task "Garantir que o schema existe" corre sempre o `init.sql` via `docker exec` após a BD estar pronta — como o `init.sql` usa `IF NOT EXISTS`, é seguro correr em volumes com dados existentes
+> - O frontend não usa volume mount para o nginx.conf — recebe `BACKEND_HOST` e `BACKEND_PORT` como env vars e o nginx:alpine faz `envsubst` automaticamente ao arrancar
 
 ---
 
@@ -905,7 +1010,8 @@ Servidor de desenvolvimento:
 ### Ansible
 
 - Playbook **idempotente** — pode correr múltiplas vezes sem efeitos secundários
-- `recreate: always` garante que o container usa a nova imagem mesmo que o nome não mude
+- `recreate: true` garante que o container usa a nova imagem mesmo que o nome não mude
+- `force_source: yes` força o re-pull da imagem mesmo que a tag já exista localmente
 - Testar sempre com `--check` (dry run) antes do primeiro deploy real
 
 ---
@@ -1018,42 +1124,27 @@ Após completar uma tarefa, o assistente deve:
 
 ---
 
-### Fase 0 — Arranque e infraestrutura base (dia 0)
+### Fase 0 — Arranque e infraestrutura base (dia 0) ✅ COMPLETO
 
 Objetivo: repositório criado, Jenkins a correr, primeiro trigger a funcionar.
 
 **GitHub**
-- [ ] Confirmar data de apresentação (16/abr ou 21/mai) e constituição do grupo
-- [ ] Criar repositório GitHub com estrutura de pastas completa (mesmo que vazias)
-- [ ] Criar conta Docker Hub e repositórios `billing-frontend` e `billing-backend`
-- [ ] Adicionar `.gitignore` desde o início
+- [x] Confirmar data de apresentação e constituição do grupo
+- [x] Criar repositório GitHub com estrutura de pastas completa
+- [x] Criar conta Docker Hub e repositórios `billing-frontend` e `billing-backend`
+- [x] Adicionar `.gitignore` desde o início
 
 **Jenkins — instalação**
-- [ ] Instalar Jenkins via Docker (mais rápido e sem conflitos com o sistema):
-  ```bash
-  docker run -d -p 8080:8080 -p 50000:50000 \
-    -v jenkins_home:/var/jenkins_home \
-    --name jenkins \
-    jenkins/jenkins:lts
-  ```
-- [ ] Aceder a `localhost:8080`, completar setup inicial, instalar plugins sugeridos
-- [ ] Instalar plugins adicionais: **Ansible**, **Docker Pipeline**, **GitHub Integration**
+- [x] Construir imagem customizada a partir de `jenkins/Dockerfile` (inclui Docker CLI, Ansible, pip, sudo)
+- [x] Arrancar container com volume `jenkins_home` e socket Docker Desktop WSL2
+- [x] Aceder a `localhost:8080`, completar setup inicial, instalar plugins sugeridos
+- [x] Instalar plugins adicionais: **Ansible**, **Docker Pipeline**, **GitHub Integration**
+- [x] Instalar collection `community.docker` via `ansible-galaxy`
 
 **Jenkins — primeiro job**
-- [ ] Criar ficheiro `jenkins/Jenkinsfile` no repositório com apenas o stage de Checkout:
-  ```groovy
-  pipeline {
-    agent any
-    stages {
-      stage('Checkout') {
-        steps { checkout scm }
-      }
-    }
-  }
-  ```
-- [ ] Criar job Jenkins: New Item → Pipeline → Pipeline script from SCM → apontar para o repo
-- [ ] Configurar trigger: GitHub hook trigger (ou Poll SCM `H/5 * * * *` se não houver IP público)
-- [ ] Fazer push ao repo e confirmar que o Jenkins deteta a mudança e corre o Checkout
+- [x] Criar ficheiro `jenkins/Jenkinsfile` no repositório
+- [x] Criar job Jenkins apontado para o repo com Poll SCM `H/5 * * * *`
+- [x] Confirmar que o Jenkins deteta pushes e corre a pipeline
 
 **Estado da pipeline no fim desta fase:**
 ```
@@ -1062,18 +1153,18 @@ Checkout ✓
 
 ---
 
-### Fase 1 — Backend e base de dados (dias 1–3)
+### Fase 1 — Backend e base de dados (dias 1–3) ✅ COMPLETO
 
 Objetivo: API REST funcional testável com Postman, sem Docker ainda.
 
 **Código**
-- [ ] Criar `backend/src/db/init.sql` com schema completo (tabelas `users` e `expenses`)
-- [ ] Implementar `backend/src/db/client.js` — pg Pool usando env vars
-- [ ] Implementar `backend/src/routes/auth.js` — POST /register e POST /login com bcrypt + JWT
-- [ ] Implementar `backend/src/middleware/auth.js` — verificação de token JWT
-- [ ] Implementar `backend/src/routes/expenses.js` — CRUD completo com filtros
-- [ ] Criar `backend/.env` local (gitignored) e `backend/.env.example` (commitado)
-- [ ] Testar todos os endpoints com Postman ou curl
+- [x] Criar `backend/src/db/init.sql` com schema completo (tabelas `users` e `expenses`), com `IF NOT EXISTS`
+- [x] Implementar `backend/src/db/client.js` — pg Pool usando env vars
+- [x] Implementar `backend/src/routes/auth.js` — POST /register e POST /login com bcrypt + JWT
+- [x] Implementar `backend/src/middleware/auth.js` — verificação de token JWT
+- [x] Implementar `backend/src/routes/expenses.js` — CRUD completo com filtros
+- [x] Criar `backend/.env` local (gitignored) e `backend/.env.example` (commitado)
+- [x] Testar todos os endpoints
 
 **Jenkins — nenhuma alteração nesta fase**
 
@@ -1103,44 +1194,16 @@ Checkout ✓
 
 ---
 
-### Fase 2 — Frontend (dias 2–4)
+### Fase 2 — Frontend (dias 2–4) ✅ COMPLETO
 
 Objetivo: interface React funcional a comunicar com o backend local.
 
 **Código**
-- [ ] Criar projeto React com Vite (`npm create vite@latest frontend -- --template react`)
-- [ ] Implementar `src/api/client.js` — axios com header Authorization automático
-- [ ] Implementar páginas: Login, Register, Dashboard
-- [ ] Implementar componentes: ExpenseList, ExpenseForm, ExpenseFilters
-- [ ] Criar `frontend/.env` local e `frontend/.env.example`
-- [ ] Testar app no browser com backend a correr localmente (`node src/index.js`)
-
-**Comandos para testar o frontend localmente (facultativo — apenas para desenvolvimento)**
-
-> Estes comandos servem apenas para testar o frontend antes da containerização. Não são necessários em produção.
-
-```bash
-# 1. Base de dados
-docker run -d --name billing-db \
-  -e POSTGRES_DB=billing_db \
-  -e POSTGRES_USER=billing_user \
-  -e POSTGRES_PASSWORD=change_me \
-  -p 5432:5432 \
-  postgres:16-alpine
-
-# 2. Inicializar o schema (aguardar 4 segundos)
-sleep 4 && docker exec -i billing-db psql -U billing_user -d billing_db \
-  < backend/src/db/init.sql
-
-# 3. Backend (terminal 1)
-cd backend && node src/index.js
-
-# 4. Frontend (terminal 2)
-cd frontend && npm install && npm run dev
-```
-
-> Se o container `billing-db` já existir de sessão anterior: `docker start billing-db` (schema já está inicializado).
-> Frontend disponível em `http://localhost:5173`
+- [x] Criar projeto React com Vite
+- [x] Implementar `src/api/client.js` — axios com header Authorization automático
+- [x] Implementar páginas: Login, Register, Dashboard
+- [x] Implementar componentes: ExpenseList, ExpenseForm, ExpenseFilters
+- [x] Testar app no browser com backend a correr localmente
 
 **Jenkins — nenhuma alteração nesta fase**
 
@@ -1151,30 +1214,19 @@ Checkout ✓
 
 ---
 
-### Fase 3 — Containerização (dias 3–5)
+### Fase 3 — Containerização (dias 3–5) ✅ COMPLETO
 
 Objetivo: `docker-compose up` local funcional com os 3 containers a comunicar.
 
 **Código**
-- [ ] Criar `backend/Dockerfile`
-- [ ] Criar `frontend/Dockerfile` (multi-stage: node build → nginx serve)
-- [ ] Criar `frontend/nginx.conf` com proxy reverso `/api/*` → `backend:3000`
-- [ ] Criar `docker-compose.yml` local com healthcheck na BD e `restart: unless-stopped` em todos os serviços
-- [ ] Testar `docker-compose up --build` e verificar que a app funciona em `localhost:80`
-- [ ] Verificar que `init.sql` corre automaticamente na primeira inicialização
-- [ ] Verificar persistência de dados: `docker-compose down` + `docker-compose up` → dados mantidos
+- [x] Criar `backend/Dockerfile`
+- [x] Criar `frontend/Dockerfile` (multi-stage: node build → nginx serve com template envsubst)
+- [x] Criar `frontend/nginx.conf` com `${BACKEND_HOST}:${BACKEND_PORT}` (env var templating)
+- [x] Criar `docker-compose.yml` local com healthcheck na BD, env vars no frontend, `restart: unless-stopped`
+- [x] Verificar que `docker-compose up --build` funciona em `localhost:80`
 
-**Jenkins — adicionar stage Build**
-- [ ] Atualizar `jenkins/Jenkinsfile` com o stage Build:
-  ```groovy
-  stage('Build images') {
-    steps {
-      sh "docker build -t billing-backend:${BUILD_NUMBER} ./backend"
-      sh "docker build -t billing-frontend:${BUILD_NUMBER} ./frontend"
-    }
-  }
-  ```
-- [ ] Fazer push e confirmar que o Jenkins constrói as imagens com sucesso
+**Jenkins — stage Build adicionado**
+- [x] Jenkinsfile actualizado com stage `Build images`
 
 **Estado da pipeline no fim desta fase:**
 ```
@@ -1183,94 +1235,50 @@ Checkout ✓ → Build images ✓
 
 ---
 
-### Fase 4 — Docker Hub (dias 5–6)
+### Fase 4 — Docker Hub (dias 5–6) ✅ COMPLETO
 
 Objetivo: imagens publicadas no Docker Hub após cada build Jenkins bem-sucedida.
 
 **Docker Hub**
-- [ ] Confirmar que os repositórios `billing-frontend` e `billing-backend` estão criados no Docker Hub
+- [x] Repositórios `billing-frontend` e `billing-backend` criados no Docker Hub (ricardodrisec)
 
 **Jenkins — credenciais e stage Push**
-- [ ] Criar credencial no Jenkins: Manage Jenkins → Credentials → Add → Username with password
-  - ID: `dockerhub-creds` · Username: utilizador Docker Hub · Password: password Docker Hub
-- [ ] Criar credencial `db-password` (Secret text) — password BD para produção
-- [ ] Criar credencial `jwt-secret` (Secret text) — JWT secret para produção
-- [ ] Atualizar `jenkins/Jenkinsfile` com o stage Push:
-  ```groovy
-  stage('Push to Docker Hub') {
-    steps {
-      withCredentials([usernamePassword(
-        credentialsId: 'dockerhub-creds',
-        usernameVariable: 'DOCKERHUB_USER',
-        passwordVariable: 'DOCKERHUB_PASS'
-      )]) {
-        sh "docker login -u ${DOCKERHUB_USER} -p ${DOCKERHUB_PASS}"
-        sh "docker tag billing-backend:${BUILD_NUMBER} ${DOCKERHUB_USER}/billing-backend:${BUILD_NUMBER}"
-        sh "docker push ${DOCKERHUB_USER}/billing-backend:${BUILD_NUMBER}"
-        sh "docker tag billing-backend:${BUILD_NUMBER} ${DOCKERHUB_USER}/billing-backend:latest"
-        sh "docker push ${DOCKERHUB_USER}/billing-backend:latest"
-        sh "docker tag billing-frontend:${BUILD_NUMBER} ${DOCKERHUB_USER}/billing-frontend:${BUILD_NUMBER}"
-        sh "docker push ${DOCKERHUB_USER}/billing-frontend:${BUILD_NUMBER}"
-        sh "docker tag billing-frontend:${BUILD_NUMBER} ${DOCKERHUB_USER}/billing-frontend:latest"
-        sh "docker push ${DOCKERHUB_USER}/billing-frontend:latest"
-      }
-    }
-  }
-  ```
-- [ ] Adicionar bloco `post` com notificações de email (configurar SMTP em Manage Jenkins → Configure System):
-  ```groovy
-  post {
-    success { mail to: 'equipa@email.com', subject: "Build #${BUILD_NUMBER} OK", body: "Deploy concluído." }
-    failure { mail to: 'equipa@email.com', subject: "Build #${BUILD_NUMBER} FALHOU", body: "Ver logs: ${BUILD_URL}console" }
-    always  { sh "docker rmi billing-backend:${BUILD_NUMBER} billing-frontend:${BUILD_NUMBER} || true" }
-  }
-  ```
-- [ ] Fazer push e confirmar imagens visíveis no Docker Hub com a tag correta
+- [x] Credencial `dockerhub-creds` criada (Username with password)
+- [x] Credencial `db-password` criada (Secret text)
+- [x] Credencial `jwt-secret` criada (Secret text)
+- [x] Stage `Push to Docker Hub` adicionado ao Jenkinsfile (com `sh 'docker login ...'` em aspas simples para não expor o secret via Groovy)
+- [x] Imagens publicadas com tag `BUILD_NUMBER` e `latest`
 
 **Estado da pipeline no fim desta fase:**
 ```
 Checkout ✓ → Build images ✓ → Push to Docker Hub ✓
-                                        + email notifications ✓
 ```
 
 ---
 
-### Fase 5 — Ansible deploy (dias 6–8)
+### Fase 5 — Ansible deploy (dias 6–8) ✅ COMPLETO
 
 Objetivo: Ansible a fazer deploy automático em cada servidor após cada push. **Sem docker-compose no servidor** — Ansible usa `community.docker.docker_container` directamente.
 
 **Ansible — estrutura**
-- [ ] Criar `ansible/inventory.ini` com grupos `[db_servers]`, `[backend_servers]`, `[frontend_servers]` (pode apontar todos para o mesmo IP numa única VM)
-- [ ] Criar `ansible/group_vars/all.yml` com variáveis não-sensíveis (incluindo `db_host` e `backend_host`)
-- [ ] Criar `ansible/templates/nginx.conf.j2` com `proxy_pass http://{{ backend_host }}:{{ backend_port }}/`
-- [ ] Criar `ansible/playbook.yml` com 3 plays (`Deploy DB`, `Deploy Backend`, `Deploy Frontend`)
-- [ ] Testar localmente: `ansible-playbook -i ansible/inventory.ini ansible/playbook.yml --check`
-- [ ] Testar deploy real: `ansible-playbook -i ansible/inventory.ini ansible/playbook.yml`
-- [ ] Verificar idempotência: correr o playbook 2x sem erros nem efeitos secundários
+- [x] `ansible/inventory.ini` com `localhost ansible_connection=local` para os 3 grupos (sem SSH)
+- [x] `ansible/group_vars/all.yml` com `host.docker.internal` como `db_host` e `backend_host`
+- [x] `ansible/playbook.yml` com 3 plays completos:
+  - pip SDK instalado com `--break-system-packages`
+  - `recreate: true` e `force_source: yes`
+  - `ignore_errors: yes` no task de serviço Docker (sem systemd no Jenkins container)
+  - Espera de BD pronta + schema garantido via `docker exec`
+  - Frontend sem volume mount — usa env vars `BACKEND_HOST`/`BACKEND_PORT`
+- [x] Deploy real confirmado a funcionar end-to-end
 
-**Jenkins — adicionar stage Deploy**
-- [ ] Atualizar `jenkins/Jenkinsfile` com o stage Deploy após o Push:
-  ```groovy
-  stage('Deploy via Ansible') {
-    steps {
-      withCredentials([
-        usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USER', passwordVariable: 'DOCKERHUB_PASS'),
-        string(credentialsId: 'db-password', variable: 'DB_PASS'),
-        string(credentialsId: 'jwt-secret',  variable: 'JWT_SEC')
-      ]) {
-        sh """ansible-playbook -i ansible/inventory.ini ansible/playbook.yml \
-              --extra-vars "image_tag=${BUILD_NUMBER} dockerhub_user=${DOCKERHUB_USER} \
-                            db_password=${DB_PASS} jwt_secret=${JWT_SEC}" """
-      }
-    }
-  }
-  ```
-- [ ] Fazer push e verificar deploy end-to-end completo: GitHub → Jenkins → Docker Hub → Ansible → servidor
+**Jenkins — stage Deploy adicionado**
+- [x] Stage `Deploy via Ansible` adicionado com `sh '''...'''` (aspas simples — secrets não interpolados pelo Groovy)
+- [x] Bloco `post` com emails `try/catch` para não falhar se SMTP não estiver configurado
 
 **Estado da pipeline no fim desta fase:**
 ```
 Checkout ✓ → Build images ✓ → Push to Docker Hub ✓ → Deploy via Ansible ✓
-                                        + email notifications ✓
+                                                              + email notifications ✓
 ```
 
 ---
@@ -1311,9 +1319,9 @@ O backend tenta ligar à BD imediatamente ao arrancar. Se a BD não estiver pron
 
 Sem um volume nomeado (`postgres_data`), todos os dados perdem-se ao fazer `docker-compose down`. Garantir que o volume está sempre definido no `docker-compose.yml`.
 
-### `init.sql` só corre uma vez
+### `init.sql` e idempotência do schema
 
-O PostgreSQL só executa os ficheiros em `/docker-entrypoint-initdb.d/` na **primeira inicialização** (quando o volume está vazio). Se precisares de alterar o schema, tens de fazer `docker-compose down -v` (apaga o volume) ou criar migrações manuais.
+O PostgreSQL só executa os ficheiros em `/docker-entrypoint-initdb.d/` na **primeira inicialização** (quando o volume está vazio). Para garantir que o schema existe em volumes pré-existentes (criados por builds anteriores), o playbook Ansible corre sempre `docker exec billing-db psql ... -f init.sql` após a BD estar pronta. Como o `init.sql` usa `IF NOT EXISTS` em todas as instruções, é seguro correr múltiplas vezes sem erros nem duplicação de dados.
 
 ### Segurança da API
 
