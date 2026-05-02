@@ -760,7 +760,6 @@ A solução em uso é a abordagem de env vars: o `nginx.conf` baked-in na imagem
           POSTGRES_PASSWORD: "{{ db_password }}"
         volumes:
           - "billing_pgdata:/var/lib/postgresql/data"
-          - "{{ app_dir }}/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"
         ports:
           - "{{ db_port }}:5432"
 
@@ -772,7 +771,7 @@ A solução em uso é a abordagem de env vars: o `nginx.conf` baked-in na imagem
       delay: 3
 
     - name: Garantir que o schema existe
-      command: docker exec billing-db psql -U {{ db_user }} -d {{ db_name }} -f /docker-entrypoint-initdb.d/init.sql
+      shell: "docker exec -i billing-db psql -U {{ db_user }} -d {{ db_name }} < {{ app_dir }}/init.sql"
 
 
 # =============================================================================
@@ -1321,7 +1320,7 @@ Sem um volume nomeado (`postgres_data`), todos os dados perdem-se ao fazer `dock
 
 ### `init.sql` e idempotência do schema
 
-O PostgreSQL só executa os ficheiros em `/docker-entrypoint-initdb.d/` na **primeira inicialização** (quando o volume está vazio). Para garantir que o schema existe em volumes pré-existentes (criados por builds anteriores), o playbook Ansible corre sempre `docker exec billing-db psql ... -f init.sql` após a BD estar pronta. Como o `init.sql` usa `IF NOT EXISTS` em todas as instruções, é seguro correr múltiplas vezes sem erros nem duplicação de dados.
+O PostgreSQL só executa os ficheiros em `/docker-entrypoint-initdb.d/` na **primeira inicialização** (volume vazio). Em Docker Desktop + WSL2, bind mounts de ficheiros individuais não funcionam correctamente — o Docker cria um directório no mount point em vez de um ficheiro. Por isso o `init.sql` **não é montado como volume**. Em vez disso, o playbook Ansible copia o ficheiro para dentro do container Jenkins e usa `docker exec -i ... psql < init.sql` (piping por stdin) para aplicar o schema após cada arranque da BD. Como o `init.sql` usa `IF NOT EXISTS`, é idempotente e seguro de correr em volumes com dados existentes.
 
 ### Segurança da API
 
