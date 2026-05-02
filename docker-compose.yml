@@ -35,6 +35,9 @@ services:
     build: ./frontend
     ports:
       - "80:80"
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: 3000
     depends_on: [backend]
     networks: [billing_net]
     restart: unless-stopped
