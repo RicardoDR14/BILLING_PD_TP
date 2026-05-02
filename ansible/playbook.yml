@@ -47,7 +47,7 @@
         name: billing-db
         image: postgres:16-alpine
         state: started
-        recreate: always
+        recreate: true
         restart_policy: unless-stopped
         env:
           POSTGRES_DB:       "{{ db_name }}"
@@ -101,7 +101,7 @@
         name: billing-backend
         image: "{{ dockerhub_user }}/billing-backend:{{ image_tag }}"
         state: started
-        recreate: always
+        recreate: true
         restart_policy: unless-stopped
         env:
           PORT:           "{{ backend_port }}"
@@ -169,7 +169,7 @@
         name: billing-frontend
         image: "{{ dockerhub_user }}/billing-frontend:{{ image_tag }}"
         state: started
-        recreate: always
+        recreate: true
         restart_policy: unless-stopped
         volumes:
           - "{{ app_dir }}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
