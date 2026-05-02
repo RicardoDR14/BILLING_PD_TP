@@ -12,5 +12,5 @@ app_dir:      /opt/billing
 # e pelo nginx (para alcançar o backend).
 # Localhost: 127.0.0.1 — containers comunicam via portas publicadas no host
 # VMs separadas: substituir pelo IP real de cada servidor
-db_host:      "127.0.0.1"
-backend_host: "127.0.0.1"
+db_host:      "host.docker.internal"
+backend_host: "host.docker.internal"
