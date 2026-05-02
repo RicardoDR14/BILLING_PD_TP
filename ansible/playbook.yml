@@ -1,0 +1,171 @@
+---
+
+# =============================================================================
+# Play 1 — Base de dados (PostgreSQL)
+# =============================================================================
+- name: Deploy DB
+  hosts: db_servers
+  become: true
+
+  tasks:
+
+    - name: Instalar Docker e Python pip
+      apt:
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Instalar SDK Python para Docker
+      pip:
+        name: docker
+        state: present
+
+    - name: Garantir que o serviço Docker está activo
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Criar directório da app
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copiar init.sql para o servidor
+      copy:
+        src: ../backend/src/db/init.sql
+        dest: "{{ app_dir }}/init.sql"
+        mode: "0644"
+
+    - name: Container DB
+      community.docker.docker_container:
+        name: billing-db
+        image: postgres:16-alpine
+        state: started
+        recreate: always
+        restart_policy: unless-stopped
+        env:
+          POSTGRES_DB:       "{{ db_name }}"
+          POSTGRES_USER:     "{{ db_user }}"
+          POSTGRES_PASSWORD: "{{ db_password }}"
+        volumes:
+          - "billing_pgdata:/var/lib/postgresql/data"
+          - "{{ app_dir }}/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"
+        ports:
+          - "{{ db_port }}:5432"
+
+
+# =============================================================================
+# Play 2 — Backend (Node.js/Express)
+# =============================================================================
+- name: Deploy Backend
+  hosts: backend_servers
+  become: true
+
+  tasks:
+
+    - name: Instalar Docker e Python pip
+      apt:
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Instalar SDK Python para Docker
+      pip:
+        name: docker
+        state: present
+
+    - name: Garantir que o serviço Docker está activo
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Pull imagem backend do Docker Hub
+      community.docker.docker_image:
+        name: "{{ dockerhub_user }}/billing-backend:{{ image_tag }}"
+        source: pull
+        force_source: yes
+
+    - name: Container Backend
+      community.docker.docker_container:
+        name: billing-backend
+        image: "{{ dockerhub_user }}/billing-backend:{{ image_tag }}"
+        state: started
+        recreate: always
+        restart_policy: unless-stopped
+        env:
+          PORT:           "{{ backend_port }}"
+          DB_HOST:        "{{ db_host }}"
+          DB_PORT:        "{{ db_port }}"
+          DB_NAME:        "{{ db_name }}"
+          DB_USER:        "{{ db_user }}"
+          DB_PASSWORD:    "{{ db_password }}"
+          JWT_SECRET:     "{{ jwt_secret }}"
+          JWT_EXPIRES_IN: "24h"
+        ports:
+          - "{{ backend_port }}:{{ backend_port }}"
+
+
+# =============================================================================
+# Play 3 — Frontend (React + nginx)
+# =============================================================================
+- name: Deploy Frontend
+  hosts: frontend_servers
+  become: true
+
+  tasks:
+
+    - name: Instalar Docker e Python pip
+      apt:
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Instalar SDK Python para Docker
+      pip:
+        name: docker
+        state: present
+
+    - name: Garantir que o serviço Docker está activo
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Criar directório da app
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Renderizar nginx.conf com backend_host correcto
+      template:
+        src: templates/nginx.conf.j2
+        dest: "{{ app_dir }}/nginx.conf"
+        mode: "0644"
+
+    - name: Pull imagem frontend do Docker Hub
+      community.docker.docker_image:
+        name: "{{ dockerhub_user }}/billing-frontend:{{ image_tag }}"
+        source: pull
+        force_source: yes
+
+    - name: Container Frontend
+      community.docker.docker_container:
+        name: billing-frontend
+        image: "{{ dockerhub_user }}/billing-frontend:{{ image_tag }}"
+        state: started
+        recreate: always
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ app_dir }}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+        ports:
+          - "{{ app_port }}:80"

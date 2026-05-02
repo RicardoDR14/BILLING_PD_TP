@@ -44,28 +44,53 @@ pipeline {
             }
         }
 
+        stage('Deploy via Ansible') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKERHUB_USER',
+                        passwordVariable: 'DOCKERHUB_PASS'
+                    ),
+                    string(credentialsId: 'db-password', variable: 'DB_PASS'),
+                    string(credentialsId: 'jwt-secret',  variable: 'JWT_SEC')
+                ]) {
+                    sh """
+                        ansible-playbook -i ansible/inventory.ini ansible/playbook.yml \
+                            --extra-vars "image_tag=${BUILD_NUMBER}" \
+                            --extra-vars "dockerhub_user=${DOCKERHUB_USER}" \
+                            --extra-vars "db_password=${DB_PASS}" \
+                            --extra-vars "jwt_secret=${JWT_SEC}"
+                    """
+                }
+            }
+        }
+
     }
 
     post {
-        // TODO: configurar SMTP antes de activar emails
-        // success {
-        //     script {
-        //         try {
-        //             mail(to: 'a2022147797@isec.pt',
-        //                 subject: "[billing-app] Build #${BUILD_NUMBER} — SUCESSO",
-        //                 body: "Pipeline concluída com sucesso.\nBuild: ${BUILD_URL}")
-        //         } catch(e) { echo "Email skipped: ${e.message}" }
-        //     }
-        // }
-        // failure {
-        //     script {
-        //         try {
-        //             mail(to: 'a2022147797@isec.pt',
-        //                 subject: "[billing-app] Build #${BUILD_NUMBER} — FALHOU",
-        //                 body: "A pipeline falhou. Verifica os logs em:\n${BUILD_URL}console")
-        //         } catch(e) { echo "Email skipped: ${e.message}" }
-        //     }
-        // }
+        success {
+            script {
+                try {
+                    mail(
+                        to: 'a2022147797@isec.pt',
+                        subject: "[billing-app] Build #${BUILD_NUMBER} — SUCESSO",
+                        body: "Pipeline concluída com sucesso.\nDeploy efectuado.\nBuild: ${BUILD_URL}"
+                    )
+                } catch(e) { echo "Email skipped: ${e.message}" }
+            }
+        }
+        failure {
+            script {
+                try {
+                    mail(
+                        to: 'a2022147797@isec.pt',
+                        subject: "[billing-app] Build #${BUILD_NUMBER} — FALHOU",
+                        body: "A pipeline falhou. Verifica os logs em:\n${BUILD_URL}console"
+                    )
+                } catch(e) { echo "Email skipped: ${e.message}" }
+            }
+        }
         always {
             sh "docker rmi ${IMAGE_BACKEND}:${BUILD_NUMBER} || true"
             sh "docker rmi ${IMAGE_FRONTEND}:${BUILD_NUMBER} || true"

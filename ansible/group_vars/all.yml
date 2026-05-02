@@ -1,0 +1,16 @@
+# Variáveis não-sensíveis — commitadas no repositório.
+# Secrets (db_password, jwt_secret, dockerhub_user) passam via --extra-vars do Jenkins.
+
+db_name:      billing_db
+db_user:      billing_user
+db_port:      "5432"
+backend_port: "3000"
+app_port:     "80"
+app_dir:      /opt/billing
+
+# Endereços de rede usados pelo backend (para alcançar a DB)
+# e pelo nginx (para alcançar o backend).
+# Localhost: 127.0.0.1 — containers comunicam via portas publicadas no host
+# VMs separadas: substituir pelo IP real de cada servidor
+db_host:      "127.0.0.1"
+backend_host: "127.0.0.1"
