@@ -29,7 +29,7 @@ pipeline {
                     usernameVariable: 'DOCKERHUB_USER',
                     passwordVariable: 'DOCKERHUB_PASS'
                 )]) {
-                    sh "docker login -u ${DOCKERHUB_USER} -p ${DOCKERHUB_PASS}"
+                    sh 'docker login -u $DOCKERHUB_USER -p $DOCKERHUB_PASS'
 
                     sh "docker tag ${IMAGE_BACKEND}:${BUILD_NUMBER} ${DOCKERHUB_USER}/${IMAGE_BACKEND}:${BUILD_NUMBER}"
                     sh "docker push ${DOCKERHUB_USER}/${IMAGE_BACKEND}:${BUILD_NUMBER}"
@@ -55,13 +55,13 @@ pipeline {
                     string(credentialsId: 'db-password', variable: 'DB_PASS'),
                     string(credentialsId: 'jwt-secret',  variable: 'JWT_SEC')
                 ]) {
-                    sh """
+                    sh '''
                         ansible-playbook -i ansible/inventory.ini ansible/playbook.yml \
-                            --extra-vars "image_tag=${BUILD_NUMBER}" \
-                            --extra-vars "dockerhub_user=${DOCKERHUB_USER}" \
-                            --extra-vars "db_password=${DB_PASS}" \
-                            --extra-vars "jwt_secret=${JWT_SEC}"
-                    """
+                            --extra-vars "image_tag=$BUILD_NUMBER" \
+                            --extra-vars "dockerhub_user=$DOCKERHUB_USER" \
+                            --extra-vars "db_password=$DB_PASS" \
+                            --extra-vars "jwt_secret=$JWT_SEC"
+                    '''
                 }
             }
         }
