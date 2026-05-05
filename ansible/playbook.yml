@@ -55,7 +55,6 @@
           POSTGRES_PASSWORD: "{{ db_password }}"
         volumes:
           - "billing_pgdata:/var/lib/postgresql/data"
-          - "{{ app_dir }}/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"
         ports:
           - "{{ db_port }}:5432"
 
@@ -67,7 +66,7 @@
       delay: 3
 
     - name: Garantir que o schema existe
-      command: docker exec billing-db psql -U {{ db_user }} -d {{ db_name }} -f /docker-entrypoint-initdb.d/init.sql
+      shell: "docker exec -i billing-db psql -U {{ db_user }} -d {{ db_name }} < {{ app_dir }}/init.sql"
 
 
 # =============================================================================
